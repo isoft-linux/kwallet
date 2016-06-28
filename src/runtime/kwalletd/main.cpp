@@ -41,6 +41,9 @@
 #include <sys/un.h>
 #include <unistd.h>
 
+#include <sys/stat.h>
+#include <gcrypt.h>
+
 #define BSIZE 1000
 static int pipefd = 0;
 static int socketfd = 0;
@@ -156,6 +159,61 @@ char* checkPamModule(int argc, char **argv)
 }
 #endif
 
+#define KWALLET_SALTSIZE 56
+#define KWALLET_KEYSIZE 56
+#define KWALLET_ITERATIONS 50000
+
+static char* createNewSalt(const char *path)
+{
+    char *salt = (char *)gcry_random_bytes(KWALLET_SALTSIZE, GCRY_STRONG_RANDOM);
+    FILE *fd = fopen(path, "w");
+
+    //If the file can't be created
+    if (fd == NULL)
+        return NULL;
+
+    fwrite(salt, KWALLET_SALTSIZE, 1, fd);
+    fclose(fd);
+
+    return salt;
+}
+
+int kwallet_empty_hash(const char *saltpath, char *key)
+{
+    struct stat info;
+    char *salt = NULL;
+    if (stat(saltpath, &info) != 0 || info.st_size == 0) {
+        salt = createNewSalt(saltpath);
+    } else {
+        FILE *fd = fopen(saltpath, "r");
+        if (fd == NULL)
+            return 1;
+
+        salt = (char*) malloc(sizeof(char) * KWALLET_SALTSIZE);
+        memset(salt, '\0', KWALLET_SALTSIZE);
+        fread(salt, KWALLET_SALTSIZE, 1, fd);
+        fclose(fd);
+    }
+
+    if (salt == NULL)
+        return 1;
+
+    gcry_error_t error;
+    error = gcry_control(GCRYCTL_INIT_SECMEM, 32768, 0);
+    if (error != 0)
+        return 1;
+
+    gcry_control (GCRYCTL_INITIALIZATION_FINISHED, 0);
+
+    const char *passphrase="";
+
+    error = gcry_kdf_derive(passphrase, strlen(passphrase),
+                            GCRY_KDF_PBKDF2, GCRY_MD_SHA512,
+                            salt, KWALLET_SALTSIZE,
+                            KWALLET_ITERATIONS, KWALLET_KEYSIZE, key);
+    return 0;
+}
+
 #ifdef HAVE_KF5INIT
 extern "C" Q_DECL_EXPORT int kdemain(int argc, char **argv)
 #else
@@ -166,6 +224,17 @@ int main(int argc, char **argv)
 #ifndef Q_OS_WIN
     if (getenv("PAM_KWALLET5_LOGIN")) {
         hash = checkPamModule(argc, argv);
+    } else {
+        QString localKwalletPath = QDir::homePath() + "/.local/share/kwalletd";
+        if (!QFile::exists(localKwalletPath + "/kdewallet.salt")) {
+            if (!QDir().exists(localKwalletPath)) {
+                QDir().mkpath(localKwalletPath);
+            }
+            char *key = (char *)malloc(sizeof(char) * KWALLET_KEYSIZE);
+            if (kwallet_empty_hash(QString(localKwalletPath + "/kdewallet.salt").toStdString().c_str(), key) == 0) {
+                hash = key;
+            }
+        }
     }
 #endif
 
